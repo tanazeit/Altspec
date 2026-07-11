@@ -99,7 +99,7 @@ Upon completing feature engineering and baseline configuration steps, the script
 
 __Train model with your data__
 ```bash
-    python 02_Create_model_save_parameters.py
+    python 02_Create_model.py
 ```
 
 Generated outputs
