@@ -22,7 +22,7 @@ __For CPU-only execution__
 
 __Activate the environment__
   ```bash
-      conda activate preditDDG
+      conda activate predictDDG
   ```
 
 __Structure preprocessing guide__
