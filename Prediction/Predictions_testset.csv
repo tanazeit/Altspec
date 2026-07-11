@@ -1,0 +1,5 @@
+PDB_file,Chain,WT,Position,Mutation,Predicted_ddG
+1bz6.pdb,A,L,29,N,-2.5304784774780273
+1bz6.pdb,A,V,68,N,-3.9251480102539062
+1bz6.pdb,A,F,123,T,-2.537414073944092
+1bz6.pdb,A,V,68,S,-2.960330009460449
