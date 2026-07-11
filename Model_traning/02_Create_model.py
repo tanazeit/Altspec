@@ -333,7 +333,7 @@ def run_late_fusion_experiment(config, df_train, df_val, df_all, scalers, device
     model.eval()
     # test loop in the Testset and returning the original value
 #################################################################################################################################################################################
-    test_groups = ['Testset1', 'Testset2', 'Testset3']
+    test_groups = ['Testset1', 'Testset2', 'Testset_Myoglobin', 'Testset_p53']
     results_list = []
     
     for group in test_groups:
