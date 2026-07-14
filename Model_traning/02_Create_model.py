@@ -174,13 +174,11 @@ class PairedLateFusionDataset(Dataset):
             torch.tensor(float(row['ddG']), dtype=torch.float32)
         )
 
+#Calculate a memory-efficient scaler using the online running mean/standard method and limiting the maximum number of samples
+#to prevent the system from being killed due to full RAM.
 
 def compute_late_fusion_scalers(train_df, tensor_dir="Output_tensors", max_samples=1000):
-'''
-Calculate a memory-efficient scaler using the online running mean/standard method 
-and limiting the maximum number of samples
-to prevent the system from being killed due to full RAM.
-'''
+
     #print(f" calculating RAM-saving scaler (maximum sampling {max_samples} )...", flush=True)
     
     # If there is too much data, use a random sample for calculation
