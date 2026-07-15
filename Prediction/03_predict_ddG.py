@@ -1,26 +1,12 @@
 '''
 Description: End-to-End Inference Script for Late Fusion Siamese Difference Network.
-- Takes model path and input CSV via command-line arguments.
-- Checks if Z-score scalers are embedded inside the model checkpoint (fallback to external file if not found).
-- Extracts ProstT5, ESM2, and PhysBio features for forward mutations.
-- Performs normalization and generates ddG predictions automatically.
+- Fully synchronized with 01_Extract_features_late_fusion.py and 02_Create_model.py.
+- Automatically extracts TRUE reverse mutation features (Mut -> WT) on-the-fly to serve as the 
+  Siamese pair input, matching the exact training and testset evaluation architecture.
+- Outputs predictions strictly for the forward mutations specified in the input CSV.
 
-Command Line Usage
-1. Using the default values (saved_optimized_model.pt and Input_data_for_prediction.csv):
-
-    python 03_predict_ddG.py
-
-2. specify the model file name and CSV file name via Argument:
-
-    python 03_predict_ddG.py --model path/to/model.pt --input test_mutations.csv
-
-
-my_test_mutations.csv
-PDB_file,Chain,Position,WT,Mutation
-1a23.pdb,A,45,A,V
-1a23,A,120,GLY,TRP
-2mb5.pdb,B,12,K,E
-
+Command Line Usage:
+    python 03_predict_ddG.py --model saved_optimized_model.pt --input Input_data_for_prediction.csv
 '''
 
 import os
@@ -48,7 +34,7 @@ AA_3TO1_MAP = {
 }
 
 # =====================================================================
-# 1. Model architecture 
+# 1. Model architecture (Must match 02_Create_model.py exactly)
 # =====================================================================
 class SharedHybridEncoder(nn.Module):
     def __init__(self, in_features, embed_dim=128, nhead=4, num_layers=2, dropout=0.2, cnn_dropout=0.3):
@@ -140,12 +126,10 @@ class EndToEndInferencePipeline:
         self.struct_dir = "Input_structures"
         self.prost_cache_dir = "ProstT5_intermediate"
         self.esm_cache_dir = "ESM_intermediate"
-        self.output_dir = "Inference_tensors"
         self.log_file = "Log_errors_inference.txt"
         
         os.makedirs(self.prost_cache_dir, exist_ok=True)
         os.makedirs(self.esm_cache_dir, exist_ok=True)
-        os.makedirs(self.output_dir, exist_ok=True)
         
         self._load_grantham_matrix()
         self._load_protscale_features()
@@ -173,7 +157,6 @@ class EndToEndInferencePipeline:
             
         checkpoint = torch.load(model_path, map_location=self.device)
         
-        # เช็คว่ามี Scalers เก็บในโมเดลหรือไม่
         if 'scalers' in checkpoint and checkpoint['scalers'] is not None:
             print("Found embedded scalers inside the model checkpoint! No external scaler file needed.")
             scalers = checkpoint['scalers']
@@ -185,7 +168,6 @@ class EndToEndInferencePipeline:
             else:
                 raise FileNotFoundError("Cannot find embedded scalers OR 'saved_scalers.pt'! Normalization is impossible.")
 
-        # โหลดคอนฟิกเพื่อสร้างโครงสร้างโมเดล
         config = checkpoint.get('config', {'embed_prost': 128, 'embed_esm': 128, 'embed_phys': 64, 'dropout': 0.1})
         dims = checkpoint.get('dim_features', {'dim_prost': 2048, 'dim_esm': 2560, 'dim_physbio': 26})
         
@@ -268,6 +250,46 @@ class EndToEndInferencePipeline:
                 end_idx, start_idx = seq_len, seq_len - target_len
             return matrix[start_idx:end_idx, :]
 
+    def _extract_branch_features(self, sequence, mut_idx, wt_aa, mu_aa, pdb_file, chain, pos, f_geom, dir_label):
+        """
+        Helper method to extract (ProstT5, ESM2, PhysBio) tensors for any directed mutation (fwd/rev)
+        ensuring 100% consistency with script 01_Extract_features_late_fusion.py.
+        """
+        seq_len = len(sequence)
+        seq_base = sequence[:mut_idx] + wt_aa + sequence[mut_idx+1:]
+        seq_mut = sequence[:mut_idx] + mu_aa + sequence[mut_idx+1:]
+        
+        # 1. ProstT5 Branch
+        f_prost_base = self.get_prost5_embedding(seq_base, f"{pdb_file}_{chain}_{wt_aa}{pos}_PROST")[:seq_len, :]
+        f_prost_mut = self.get_prost5_embedding(seq_mut, f"{pdb_file}_{chain}_{mu_aa}{pos}_PROST")[:seq_len, :]
+        feat_prost = np.hstack([f_prost_base, f_prost_mut - f_prost_base])
+
+        # 2. ESM2 Branch
+        f_esm_base = self.get_esm_embedding(seq_base, f"{pdb_file}_{chain}_{wt_aa}{pos}_ESM")[:seq_len, :]
+        f_esm_mut = self.get_esm_embedding(seq_mut, f"{pdb_file}_{chain}_{mu_aa}{pos}_ESM")[:seq_len, :]
+        feat_esm = np.hstack([f_esm_base, f_esm_mut - f_esm_base])
+        
+        # 3. Biophysical & Structural Branch
+        f_protscale_base = np.array([self.protscale_df.get(aa, pd.Series(np.zeros(len(self.protscale_df)))).values for aa in seq_base], dtype=np.float32)
+        try:
+            grantham_dist = self.grantham_df.loc[wt_aa, mu_aa]
+        except KeyError:
+            grantham_dist = 0.0
+        protscale_wt_val = self.protscale_df.get(wt_aa, pd.Series(np.zeros(len(self.protscale_df)))).values
+        protscale_mu_val = self.protscale_df.get(mu_aa, pd.Series(np.zeros(len(self.protscale_df)))).values
+        protscale_sub = protscale_mu_val - protscale_wt_val
+        
+        f_mutation_profile = np.concatenate([[grantham_dist], protscale_wt_val, protscale_mu_val, protscale_sub])
+        f_mut_matrix = np.tile(f_mutation_profile, (seq_len, 1)).astype(np.float32)
+        feat_physbio = np.hstack([f_protscale_base, f_geom, f_mut_matrix])
+
+        # Apply padding / cropping to fixed length 500
+        t_prost = torch.tensor(self.get_fixed_length_500(feat_prost, mut_idx, target_len=500), dtype=torch.float32)
+        t_esm = torch.tensor(self.get_fixed_length_500(feat_esm, mut_idx, target_len=500), dtype=torch.float32)
+        t_physbio = torch.tensor(self.get_fixed_length_500(feat_physbio, mut_idx, target_len=500), dtype=torch.float32)
+        
+        return t_prost, t_esm, t_physbio
+
     def predict_from_csv(self, input_csv):
         df = pd.read_csv(input_csv)
         print(f"\nStarting extraction and prediction for {len(df)} rows from '{input_csv}'...")
@@ -290,7 +312,7 @@ class EndToEndInferencePipeline:
                     self.log_error(f"Skipping index [{idx+1}]: process freezes {pdb_file}")
                     predictions.append(np.nan); continue
                 if not res_dict['success']: 
-                    self.log_error(f"Skipping index [{idx+1}]: failed to retrieved {pdb_file} ({res_dict['error']})")
+                    self.log_error(f"Skipping index [{idx+1}]: failed to retrieve {pdb_file} ({res_dict['error']})")
                     predictions.append(np.nan); continue
 
                 mut_idx = next((i for i, r in enumerate(res_dict['residues']) if r.get_id()[1] == pos), -1)
@@ -308,37 +330,33 @@ class EndToEndInferencePipeline:
                 if len(f_geom) < seq_len:
                     f_geom = np.vstack([f_geom, np.zeros((seq_len - len(f_geom), 2), dtype=np.float32)])
 
-                seq_base = sequence[:mut_idx] + wt + sequence[mut_idx+1:]
-                seq_mut = sequence[:mut_idx] + mu + sequence[mut_idx+1:]
+                # ----------------------------------------------------------------------------------
+                # 1. Extract Forward features (WT -> Mut) to act as MAIN input
+                # ----------------------------------------------------------------------------------
+                t_prost_main, t_esm_main, t_phys_main = self._extract_branch_features(
+                    sequence, mut_idx, wt, mu, pdb_file, chain, pos, f_geom, dir_label="fwd"
+                )
                 
-                # Extract Branches
-                f_prost_base = self.get_prost5_embedding(seq_base, f"{pdb_file}_{chain}_{wt}{pos}_PROST")[:seq_len, :]
-                f_prost_mut = self.get_prost5_embedding(seq_mut, f"{pdb_file}_{chain}_{mu}{pos}_PROST")[:seq_len, :]
-                feat_prost = np.hstack([f_prost_base, f_prost_mut - f_prost_base])
+                # ----------------------------------------------------------------------------------
+                # 2. Extract Reverse features (Mut -> WT) to act as PAIR input
+                # ----------------------------------------------------------------------------------
+                t_prost_pair, t_esm_pair, t_phys_pair = self._extract_branch_features(
+                    sequence, mut_idx, mu, wt, pdb_file, chain, pos, f_geom, dir_label="rev"
+                )
 
-                f_esm_base = self.get_esm_embedding(seq_base, f"{pdb_file}_{chain}_{wt}{pos}_ESM")[:seq_len, :]
-                f_esm_mut = self.get_esm_embedding(seq_mut, f"{pdb_file}_{chain}_{mu}{pos}_ESM")[:seq_len, :]
-                feat_esm = np.hstack([f_esm_base, f_esm_mut - f_esm_base])
+                # Process Tensors & Normalization (Main & Pair)
+                p_m = self._scale_tensor(t_prost_main, 'prost').unsqueeze(0).to(self.device)
+                p_p = self._scale_tensor(t_prost_pair, 'prost').unsqueeze(0).to(self.device)
                 
-                f_protscale_base = np.array([self.protscale_df.get(aa, pd.Series(np.zeros(len(self.protscale_df)))).values for aa in seq_base], dtype=np.float32)
-                try: grantham_dist = self.grantham_df.loc[wt, mu]
-                except KeyError: grantham_dist = 0.0
-                protscale_wt_val = self.protscale_df.get(wt, pd.Series(np.zeros(len(self.protscale_df)))).values
-                protscale_mu_val = self.protscale_df.get(mu, pd.Series(np.zeros(len(self.protscale_df)))).values
-                f_mut_matrix = np.tile(np.concatenate([[grantham_dist], protscale_wt_val, protscale_mu_val, protscale_mu_val - protscale_wt_val]), (seq_len, 1)).astype(np.float32)
-                feat_physbio = np.hstack([f_protscale_base, f_geom, f_mut_matrix])
+                e_m = self._scale_tensor(t_esm_main, 'esm').unsqueeze(0).to(self.device)
+                e_p = self._scale_tensor(t_esm_pair, 'esm').unsqueeze(0).to(self.device)
+                
+                ph_m = self._scale_tensor(t_phys_main, 'physbio').unsqueeze(0).to(self.device)
+                ph_p = self._scale_tensor(t_phys_pair, 'physbio').unsqueeze(0).to(self.device)
 
-                # Process Tensors & Normalization
-                tensor_prost = self._scale_tensor(torch.tensor(self.get_fixed_length_500(feat_prost, mut_idx)), 'prost').unsqueeze(0).to(self.device)
-                tensor_esm = self._scale_tensor(torch.tensor(self.get_fixed_length_500(feat_esm, mut_idx)), 'esm').unsqueeze(0).to(self.device)
-                tensor_physbio = self._scale_tensor(torch.tensor(self.get_fixed_length_500(feat_physbio, mut_idx)), 'physbio').unsqueeze(0).to(self.device)
-
-                # Predict ddG (Main input vs Dummy pair input for architecture requirement)
+                # Predict ddG using true Siamese pairs (returning only the forward prediction!)
                 with torch.no_grad():
-                    dummy_prost = -tensor_prost
-                    dummy_esm = -tensor_esm
-                    dummy_physbio = -tensor_physbio
-                    pred_ddg = self.model(tensor_prost, dummy_prost, tensor_esm, dummy_esm, tensor_physbio, dummy_physbio).item()
+                    pred_ddg = self.model(p_m, p_p, e_m, e_p, ph_m, ph_p).item()
 
                 predictions.append(pred_ddg)
                 print(f"Predicted [{idx+1}/{len(df)}] {pdb_file} {wt}{pos}{mu} -> ddG: {pred_ddg:.4f}")
@@ -347,7 +365,7 @@ class EndToEndInferencePipeline:
                 self.log_error(f"Skipping [{idx+1}]: error occurred -> {e}")
                 predictions.append(np.nan)
 
-        # Save Results
+        # Save Results (Only forward predictions corresponding to the input CSV)
         df['Predicted_ddG'] = predictions
         output_csv = f"Predictions_{os.path.basename(input_csv)}"
         df.to_csv(output_csv, index=False, encoding='utf-8-sig')
