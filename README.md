@@ -50,7 +50,7 @@ Ensure your working folder contain all these files/folder before executing the s
 __Execution__
 ```bash
 # Specifying custom model paths and datasets explicitly
-python 03_predict_ddG.py --model path/to/model.pt --input test_predict.csv
+python predict_ddG.py --model path/to/model.pt --input test_predict.csv
 ```
 __Expected output__
 The script generates a new results file prefixed with Predictions_:
