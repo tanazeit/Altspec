@@ -1,12 +1,6 @@
 '''
-Description: End-to-End Inference Script for Late Fusion Siamese Difference Network.
-- Fully synchronized with 01_Extract_features_late_fusion.py and 02_Create_model.py.
-- Automatically extracts TRUE reverse mutation features (Mut -> WT) on-the-fly to serve as the 
-  Siamese pair input, matching the exact training and testset evaluation architecture.
-- Outputs predictions strictly for the forward mutations specified in the input CSV.
-
 Command Line Usage:
-    python 03_predict_ddG.py --model saved_optimized_model.pt --input Input_data_for_prediction.csv
+    python predict_ddG.py --model saved_optimized_model.pt --input Input_data_for_prediction.csv
 '''
 
 import os
